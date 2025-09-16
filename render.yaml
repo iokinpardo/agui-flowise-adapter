@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: agui-flowise-adapter
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: FLOWISE_BASE_URL
+        sync: false
+      - key: FLOWISE_API_KEY
+        sync: false
