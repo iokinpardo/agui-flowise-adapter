@@ -1,7 +1,8 @@
-
 import express from 'express';
 import cors from 'cors';
-import fetch from 'node-fetch';
+
+// ⚠️ IMPORTANTE: no uses `node-fetch`, ya que Node 18+ trae `fetch` nativo (Undici).
+// Si lo tenías instalado, puedes desinstalarlo con: npm uninstall node-fetch
 
 const app = express();
 app.use(cors());
@@ -15,7 +16,7 @@ const PORT = Number(process.env.PORT || 8787);
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 /**
- * SSE endpoint: translates Flowise Prediction SSE -> AG-UI events.
+ * SSE endpoint: traduce el stream SSE de Flowise a eventos AG-UI.
  * GET /agui/stream?chatflowId=...&q=...
  */
 app.get('/agui/stream', async (req, res) => {
@@ -29,7 +30,7 @@ app.get('/agui/stream', async (req, res) => {
     return;
   }
 
-  // Prepare SSE
+  // Configuración de SSE
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -41,7 +42,7 @@ app.get('/agui/stream', async (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
-  // Emit run.input
+  // Emitimos run.input
   sendEvent('run.input', {
     id: runId,
     messages: [{ id: 'user_' + Date.now(), role: 'user', content: question }]
@@ -49,13 +50,15 @@ app.get('/agui/stream', async (req, res) => {
 
   try {
     const url = `${FLOWISE_BASE_URL}/api/v1/prediction/${encodeURIComponent(chatflowId)}`;
-    const body: Record<string, any> = { question, streaming: true };
+    // En algunos despliegues se usa "stream: true" en lugar de "streaming: true".
+    const body: Record<string, any> = { question, stream: true };
 
     const resp = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(FLOWISE_API_KEY ? { 'Authorization': `Bearer ${FLOWISE_API_KEY}` } : {})
+        ...(FLOWISE_API_KEY ? { 'Authorization': `Bearer ${FLOWISE_API_KEY}` } : {}),
+        'Accept': 'text/event-stream'
       },
       body: JSON.stringify(body)
     });
@@ -69,45 +72,56 @@ app.get('/agui/stream', async (req, res) => {
       return;
     }
 
-    const reader = (resp.body as any).getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let finished = false;
+    const processLine = (line: string) => {
+      if (!line.startsWith('data:')) return;
+      const raw = line.slice(5).trim();
+      if (raw === '[DONE]') {
+        sendEvent('message.completed', { id: messageId, role: 'assistant' });
+        sendEvent('run.completed', { id: runId });
+        res.end();
+        return 'DONE';
+      }
+      try {
+        const chunk = JSON.parse(raw);
+        const token = typeof chunk === 'string' ? chunk : (chunk.text ?? '');
+        if (token) sendEvent('message.delta', { id: messageId, delta: { content: token } });
+      } catch {
+        sendEvent('message.delta', { id: messageId, delta: { content: raw } });
+      }
+    };
 
-    while (!finished) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      // Process lines 'data: ...\n'
-      let idx: number;
-      while ((idx = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
-        if (!line) continue;
-        if (!line.startsWith('data:')) continue;
-
-        const raw = line.slice(5).trim();
-        if (raw === '[DONE]') {
-          sendEvent('message.completed', { id: messageId, role: 'assistant' });
-          sendEvent('run.completed', { id: runId });
-          finished = true;
-          res.end();
-          break;
+    // --- Caso 1: Web Streams (Undici en Node 18/20) ---
+    if (typeof (resp.body as any).getReader === 'function') {
+      const reader = (resp.body as any).getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line) continue;
+          if (processLine(line) === 'DONE') return;
         }
-
-        try {
-          const chunk = JSON.parse(raw);
-          const token = typeof chunk === 'string' ? chunk : (chunk.text ?? '');
-          if (token) {
-            sendEvent('message.delta', { id: messageId, delta: { content: token } });
-          }
-        } catch {
-          // If not JSON, emit raw
-          sendEvent('message.delta', { id: messageId, delta: { content: raw } });
+      }
+    } else {
+      // --- Caso 2: Node Readable Stream clásico ---
+      let buffer = '';
+      for await (const chunk of resp.body as any) {
+        buffer += chunk.toString();
+        let idx: number;
+        while ((idx = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line) continue;
+          if (processLine(line) === 'DONE') return;
         }
       }
     }
+
   } catch (err: any) {
     sendEvent('run.error', { id: runId, error: String(err?.message || err) });
     sendEvent('message.error', { id: messageId, error: 'Unexpected streaming error' });
