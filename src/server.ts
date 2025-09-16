@@ -1,3 +1,4 @@
+
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
@@ -13,25 +14,34 @@ const PORT = Number(process.env.PORT || 8787);
 // Healthcheck
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+/**
+ * SSE endpoint: translates Flowise Prediction SSE -> AG-UI events.
+ * GET /agui/stream?chatflowId=...&q=...
+ */
 app.get('/agui/stream', async (req, res) => {
   const chatflowId = String(req.query.chatflowId || '');
   const question   = String(req.query.q || '');
   const runId      = 'run_' + Date.now();
   const messageId  = 'msg_' + Date.now();
-  if (!chatflowId or not question) {
+
+  if (!chatflowId || !question) {
     res.status(400).json({ error: 'chatflowId y q son obligatorios' });
     return;
   }
 
+  // Prepare SSE
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
   });
-  const sendEvent = (event, data) => {
+
+  const sendEvent = (event: string, data: any) => {
     res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
+
+  // Emit run.input
   sendEvent('run.input', {
     id: runId,
     messages: [{ id: 'user_' + Date.now(), role: 'user', content: question }]
@@ -39,7 +49,8 @@ app.get('/agui/stream', async (req, res) => {
 
   try {
     const url = `${FLOWISE_BASE_URL}/api/v1/prediction/${encodeURIComponent(chatflowId)}`;
-    const body = { question, streaming: true };
+    const body: Record<string, any> = { question, streaming: true };
+
     const resp = await fetch(url, {
       method: 'POST',
       headers: {
@@ -48,6 +59,7 @@ app.get('/agui/stream', async (req, res) => {
       },
       body: JSON.stringify(body)
     });
+
     if (!resp.ok || !resp.body) {
       const text = await resp.text();
       sendEvent('run.error', { id: runId, error: `Prediction API ${resp.status}: ${text}` });
@@ -56,19 +68,25 @@ app.get('/agui/stream', async (req, res) => {
       res.end();
       return;
     }
-    const reader = resp.body.getReader();
+
+    const reader = (resp.body as any).getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let finished = false;
+
     while (!finished) {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      let idx;
+
+      // Process lines 'data: ...\n'
+      let idx: number;
       while ((idx = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx + 1);
+        if (!line) continue;
         if (!line.startsWith('data:')) continue;
+
         const raw = line.slice(5).trim();
         if (raw === '[DONE]') {
           sendEvent('message.completed', { id: messageId, role: 'assistant' });
@@ -77,6 +95,7 @@ app.get('/agui/stream', async (req, res) => {
           res.end();
           break;
         }
+
         try {
           const chunk = JSON.parse(raw);
           const token = typeof chunk === 'string' ? chunk : (chunk.text ?? '');
@@ -84,11 +103,12 @@ app.get('/agui/stream', async (req, res) => {
             sendEvent('message.delta', { id: messageId, delta: { content: token } });
           }
         } catch {
+          // If not JSON, emit raw
           sendEvent('message.delta', { id: messageId, delta: { content: raw } });
         }
       }
     }
-  } catch (err) {
+  } catch (err: any) {
     sendEvent('run.error', { id: runId, error: String(err?.message || err) });
     sendEvent('message.error', { id: messageId, error: 'Unexpected streaming error' });
     sendEvent('run.completed', { id: runId });
