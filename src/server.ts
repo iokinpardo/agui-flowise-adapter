@@ -86,55 +86,85 @@ function extractFinalText(payload: any): string {
   }
 }
 
-/** Intenta extraer y emitir cambios de flow.state (p.ej. step) desde estructuras varias */
-function maybeEmitStateUpdates(
+/** Emite diff de estado: cualquier clave que cambie, no sólo "step" */
+function emitStateDiff(
   res: any,
+  lastState: Record<string, any>,
+  nextState: Record<string, any>,
+  source?: { nodeId?: string; nodeLabel?: string }
+) {
+  if (!nextState || typeof nextState !== 'object') return;
+
+  const changed: Record<string, any> = {};
+  let somethingChanged = false;
+
+  // Detecta cambios o nuevas claves
+  for (const [k, v] of Object.entries(nextState)) {
+    const prev = lastState[k];
+    if (prev !== v) {
+      changed[k] = v;
+      lastState[k] = v;
+      somethingChanged = true;
+    }
+  }
+
+  // Detecta claves eliminadas (opc.)
+  for (const k of Object.keys(lastState)) {
+    if (!(k in nextState)) {
+      changed[k] = undefined;
+      delete lastState[k];
+      somethingChanged = true;
+    }
+  }
+
+  if (somethingChanged) {
+    sseEvent(res, 'status.update', {
+      at: Date.now(),
+      state: { changed, full: { ...lastState } },
+      ...(source ? { source } : {})
+    });
+  }
+}
+
+/** Busca y emite diffs de estado desde un nodo (cualquier clave) + emite contenido si existe */
+function handleExecutedNode(
+  res: any,
+  messageId: string,
   lastState: Record<string, any>,
   node: any
 ) {
-  // node puede ser estructura { nodeId, nodeLabel, data: { state: {...} } }
   const nodeId = node?.nodeId || node?.data?.id;
   const nodeLabel = node?.nodeLabel || node?.data?.name;
 
   // 1) Estado directo en node.data.state
   const st = node?.data?.state;
   if (st && typeof st === 'object') {
-    if (Object.prototype.hasOwnProperty.call(st, 'step')) {
-      const next = st.step;
-      if (lastState.step !== next) {
-        lastState.step = next;
-        sseEvent(res, 'status.update', {
-          at: Date.now(),
-          state: { step: String(next) },
-          source: { nodeId, nodeLabel }
-        });
-      }
+    emitStateDiff(res, lastState, st, { nodeId, nodeLabel });
+  }
+
+  // 2) Updates declarativos en input.agentUpdateState: [{key, value}]
+  const updates = node?.data?.input?.agentUpdateState;
+  if (Array.isArray(updates)) {
+    const next: Record<string, any> = {};
+    for (const u of updates) {
+      if (u?.key) next[u.key] = u?.value;
+    }
+    if (Object.keys(next).length) {
+      emitStateDiff(res, lastState, next, { nodeId, nodeLabel });
     }
   }
 
-  // 2) Algunas entradas ponen updates en input.agentUpdateState: [{key:"step", value:"..."}]
-  const updates = node?.data?.input?.agentUpdateState;
-  if (Array.isArray(updates)) {
-    for (const u of updates) {
-      if (u?.key === 'step') {
-        const next = u?.value;
-        if (lastState.step !== next) {
-          lastState.step = next;
-          sseEvent(res, 'status.update', {
-            at: Date.now(),
-            state: { step: String(next) },
-            source: { nodeId, nodeLabel }
-          });
-        }
-      }
-    }
+  // 3) Contenido conversacional del nodo (si existe)
+  const content = node?.data?.output?.content;
+  if (typeof content === 'string' && content.trim()) {
+    emitChunked(res, messageId, content);
   }
 }
 
 /**
  * GET /agui/stream?chatflowId=...&q=...
  * Traduce Flowise Prediction (SSE o JSON) -> eventos AG-UI,
- * e incluye status.update con cambios en flow.state (p.ej. step).
+ * y emite status.update con diffs de flow.state (todas las claves).
  */
 app.get('/agui/stream', async (req, res) => {
   const chatflowId = String(req.query.chatflowId || '');
@@ -194,31 +224,25 @@ app.get('/agui/stream', async (req, res) => {
       return;
     }
 
-    // --- Parser SSE robusto con captura de estados ---
+    // --- Parser SSE robusto con captura de estados (todas las claves) ---
     let sawAnyData = false;
     const decoder = new TextDecoder();
     let buffer = '';
-    const lastState: Record<string, any> = {}; // aquí guardamos el último step emitido
+    const lastState: Record<string, any> = {}; // diff acumulado por request
 
     const handleFlowiseControlEnvelope = (obj: any): boolean => {
-      // Devuelve true si es "sobre" de control y ya fue manejado (no emitir como delta de texto)
-      // Patrones de tus ejemplos:
-      //  - {"event":"nextAgentFlow","data":{ nodeId, nodeLabel, status }}
-      //  - {"event":"agentFlowExecutedData","data":[ {nodeId, nodeLabel, data:{state:{step:"..."}}}, ... ]}
-      //  - {"event":"metadata", "data": {...}}
+      // Devuelve true si es "sobre" de control y ya fue manejado.
       const ev = obj?.event;
       const data = obj?.data;
 
       if (!ev) return false;
 
       if (ev === 'metadata' && data) {
-        // Propagamos metadatos como status.update (AG-UI friendly)
         sseEvent(res, 'status.update', { at: Date.now(), metadata: data });
         return true;
       }
 
       if (ev === 'nextAgentFlow' && data) {
-        // Podemos emitir progreso del nodo (opcional)
         const nodeId = data.nodeId;
         const nodeLabel = data.nodeLabel;
         const status = data.status;
@@ -230,16 +254,15 @@ app.get('/agui/stream', async (req, res) => {
       }
 
       if (ev === 'agentFlowExecutedData' && Array.isArray(data)) {
-        // Recorremos nodos ejecutados y emitimos cambios de state (step)
         for (const node of data) {
-          maybeEmitStateUpdates(res, lastState, node);
+          handleExecutedNode(res, messageId, lastState, node);
         }
         return true;
       }
 
-      // Si el sobre trae directamente { data: { state: {...} } }
-      if (data?.state) {
-        maybeEmitStateUpdates(res, lastState, { data });
+      // “Sobre” con estado directo
+      if (data?.state && typeof data.state === 'object') {
+        emitStateDiff(res, lastState, data.state);
         return true;
       }
 
@@ -257,28 +280,29 @@ app.get('/agui/stream', async (req, res) => {
       }
       if (isControlToken(s)) return; // ignora INPROGRESS / FINISHED
 
-      // Intenta JSON → puede ser "sobre" de control o un chunk de texto
+      // Intenta JSON → puede ser “sobre” de control o chunk de texto
       try {
         const chunk = JSON.parse(s);
 
-        // 1) Si es un "sobre" de control, lo manejamos y NO lo mostramos como texto
-        if (chunk && typeof chunk === 'object' && (chunk.event || chunk.data?.state)) {
+        // 1) “Sobre” de control (gestiona estados y, si hay, también contenido)
+        if (chunk && typeof chunk === 'object' && (chunk.event || chunk.data?.state || chunk.data?.output?.content)) {
           const handled = handleFlowiseControlEnvelope(chunk);
+          // OJO: handleFlowiseControlEnvelope ya emite contenido si lo hay.
           if (handled) return;
         }
 
-        // 2) Si es un chunk con texto, emitirlo troceado
+        // 2) Texto simple en distintas ubicaciones
         let token: any =
           chunk?.text ??
           chunk?.delta?.content ??
           chunk?.data?.content ??
           chunk?.data;
-        if (typeof token === 'string') {
-          if (!isControlToken(token)) emitChunked(res, messageId, token);
+        if (typeof token === 'string' && token.trim() && !isControlToken(token)) {
+          emitChunked(res, messageId, token);
           return;
         }
 
-        // 3) Si no hay texto claro, lo emitimos “bonito” (poco frecuente)
+        // 3) Si no hay texto claro, emite raw “bonito”
         sseEvent(res, 'message.delta', { id: messageId, delta: { content: normalizeText(s) } });
       } catch {
         // No era JSON → emitimos tal cual troceado
@@ -293,7 +317,7 @@ app.get('/agui/stream', async (req, res) => {
         l = l.slice('message:'.length).trim(); // deja "data: {...}" si viene así
       }
       if (l.startsWith('event:')) {
-        // No necesitamos el nombre SSE aquí porque Flowise ya embebe "event" en el JSON
+        // Flowise ya embebe su "event" en el JSON; no necesitamos fijarlo aquí
         return;
       }
       if (l.startsWith('data:')) {
