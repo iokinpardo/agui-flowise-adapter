@@ -86,7 +86,7 @@ function extractFinalText(payload: any): string {
   }
 }
 
-/** Emite diff de estado: cualquier clave que cambie, no sólo "step" */
+/** Emite diff de estado: cualquier clave que cambie */
 function emitStateDiff(
   res: any,
   lastState: Record<string, any>,
@@ -126,45 +126,11 @@ function emitStateDiff(
   }
 }
 
-/** Busca y emite diffs de estado desde un nodo (cualquier clave) + emite contenido si existe */
-function handleExecutedNode(
-  res: any,
-  messageId: string,
-  lastState: Record<string, any>,
-  node: any
-) {
-  const nodeId = node?.nodeId || node?.data?.id;
-  const nodeLabel = node?.nodeLabel || node?.data?.name;
-
-  // 1) Estado directo en node.data.state
-  const st = node?.data?.state;
-  if (st && typeof st === 'object') {
-    emitStateDiff(res, lastState, st, { nodeId, nodeLabel });
-  }
-
-  // 2) Updates declarativos en input.agentUpdateState: [{key, value}]
-  const updates = node?.data?.input?.agentUpdateState;
-  if (Array.isArray(updates)) {
-    const next: Record<string, any> = {};
-    for (const u of updates) {
-      if (u?.key) next[u.key] = u?.value;
-    }
-    if (Object.keys(next).length) {
-      emitStateDiff(res, lastState, next, { nodeId, nodeLabel });
-    }
-  }
-
-  // 3) Contenido conversacional del nodo (si existe)
-  const content = node?.data?.output?.content;
-  if (typeof content === 'string' && content.trim()) {
-    emitChunked(res, messageId, content);
-  }
-}
-
 /**
  * GET /agui/stream?chatflowId=...&q=...
  * Traduce Flowise Prediction (SSE o JSON) -> eventos AG-UI,
- * y emite status.update con diffs de flow.state (todas las claves).
+ * emite status.update con diffs de flow.state, y evita duplicados
+ * mostrando sólo el ÚLTIMO nodo de cada paquete acumulativo.
  */
 app.get('/agui/stream', async (req, res) => {
   const chatflowId = String(req.query.chatflowId || '');
@@ -224,11 +190,57 @@ app.get('/agui/stream', async (req, res) => {
       return;
     }
 
-    // --- Parser SSE robusto con captura de estados (todas las claves) ---
+    // --- Parser SSE robusto con captura de estados + deduplicación ---
     let sawAnyData = false;
     const decoder = new TextDecoder();
     let buffer = '';
     const lastState: Record<string, any> = {}; // diff acumulado por request
+
+    // Para evitar repeticiones: recordamos el último nodo procesado y contenidos ya emitidos
+    let lastProcessedNodeId: string | null = null;
+    const emittedContentKeys = new Set<string>(); // key = `${nodeId}:${hash(text)}`
+
+    const hash = (s: string) => {
+      let h = 0;
+      for (let i = 0; i < s.length; i++) {
+        h = (h * 31 + s.charCodeAt(i)) | 0;
+      }
+      return h.toString(36);
+    };
+
+    const handleExecutedNode = (node: any) => {
+      // Sólo procesamos el ÚLTIMO nodo de cada paquete:
+      const nodeId = node?.nodeId || node?.data?.id || '';
+      const nodeLabel = node?.nodeLabel || node?.data?.name;
+
+      // Estado
+      const st = node?.data?.state;
+      if (st && typeof st === 'object') {
+        emitStateDiff(res, lastState, st, { nodeId, nodeLabel });
+      }
+      // Updates declarativos
+      const updates = node?.data?.input?.agentUpdateState;
+      if (Array.isArray(updates)) {
+        const next: Record<string, any> = {};
+        for (const u of updates) {
+          if (u?.key) next[u.key] = u?.value;
+        }
+        if (Object.keys(next).length) {
+          emitStateDiff(res, lastState, next, { nodeId, nodeLabel });
+        }
+      }
+      // Contenido (sólo si no lo emitimos ya para este nodo)
+      const content = node?.data?.output?.content;
+      if (typeof content === 'string' && content.trim()) {
+        const k = `${nodeId}:${hash(content)}`;
+        if (!emittedContentKeys.has(k)) {
+          emittedContentKeys.add(k);
+          emitChunked(res, messageId, content);
+        }
+      }
+
+      lastProcessedNodeId = nodeId || lastProcessedNodeId;
+    };
 
     const handleFlowiseControlEnvelope = (obj: any): boolean => {
       // Devuelve true si es "sobre" de control y ya fue manejado.
@@ -239,6 +251,11 @@ app.get('/agui/stream', async (req, res) => {
 
       if (ev === 'metadata' && data) {
         sseEvent(res, 'status.update', { at: Date.now(), metadata: data });
+        return true;
+      }
+
+      if (ev === 'agentFlowEvent') {
+        // INPROGRESS / FINISHED del flujo completo → ignoramos (ruido)
         return true;
       }
 
@@ -253,16 +270,29 @@ app.get('/agui/stream', async (req, res) => {
         return true;
       }
 
-      if (ev === 'agentFlowExecutedData' && Array.isArray(data)) {
-        for (const node of data) {
-          handleExecutedNode(res, messageId, lastState, node);
-        }
+      if (ev === 'agentFlowExecutedData' && Array.isArray(data) && data.length) {
+        // IMPORTANTE: Procesar SOLO el ÚLTIMO nodo del array (Flowise envía acumulativo).
+        const latestNode = data[data.length - 1];
+        // Si es el mismo nodo que ya procesamos y no hay cambios de contenido/estado, no hacer nada.
+        // (emitStateDiff ya evita emitir si no hay cambios; contenido se deduplica por hash)
+        handleExecutedNode(latestNode);
         return true;
       }
 
       // “Sobre” con estado directo
       if (data?.state && typeof data.state === 'object') {
         emitStateDiff(res, lastState, data.state);
+        return true;
+      }
+
+      // Si llega un “sobre” con posible contenido en data.output.content (no común)
+      if (data?.output?.content && typeof data.output.content === 'string') {
+        const nodeId = data?.id || '';
+        const k = `${nodeId}:${hash(data.output.content)}`;
+        if (!emittedContentKeys.has(k)) {
+          emittedContentKeys.add(k);
+          emitChunked(res, messageId, data.output.content);
+        }
         return true;
       }
 
@@ -278,16 +308,15 @@ app.get('/agui/stream', async (req, res) => {
         res.end();
         return 'DONE';
       }
-      if (isControlToken(s)) return; // ignora INPROGRESS / FINISHED
+      if (isControlToken(s)) return; // ignora INPROGRESS / FINISHED planos
 
       // Intenta JSON → puede ser “sobre” de control o chunk de texto
       try {
         const chunk = JSON.parse(s);
 
-        // 1) “Sobre” de control (gestiona estados y, si hay, también contenido)
+        // 1) “Sobre” de control (gestiona y, si hay, también contenido)
         if (chunk && typeof chunk === 'object' && (chunk.event || chunk.data?.state || chunk.data?.output?.content)) {
           const handled = handleFlowiseControlEnvelope(chunk);
-          // OJO: handleFlowiseControlEnvelope ya emite contenido si lo hay.
           if (handled) return;
         }
 
@@ -298,15 +327,26 @@ app.get('/agui/stream', async (req, res) => {
           chunk?.data?.content ??
           chunk?.data;
         if (typeof token === 'string' && token.trim() && !isControlToken(token)) {
-          emitChunked(res, messageId, token);
+          // Evitar reemitir exactamente el mismo trozo consecutivo
+          const k = `__free:${hash(token)}`;
+          if (!emittedContentKeys.has(k)) {
+            emittedContentKeys.add(k);
+            emitChunked(res, messageId, token);
+          }
           return;
         }
 
-        // 3) Si no hay texto claro, emite raw “bonito”
+        // 3) Si no hay texto claro, emite raw “bonito” (casos raros)
         sseEvent(res, 'message.delta', { id: messageId, delta: { content: normalizeText(s) } });
       } catch {
         // No era JSON → emitimos tal cual troceado
-        if (!isControlToken(s)) emitChunked(res, messageId, s);
+        if (!isControlToken(s)) {
+          const k = `__raw:${hash(s)}`;
+          if (!emittedContentKeys.has(k)) {
+            emittedContentKeys.add(k);
+            emitChunked(res, messageId, s);
+          }
+        }
       }
     };
 
