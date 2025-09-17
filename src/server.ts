@@ -18,6 +18,45 @@ function sseEvent(res: any, event: string, data: any) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+/** Normaliza texto (por ejemplo <br> -> saltos de línea) */
+function normalizeText(s: string): string {
+  return s
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\r\n/g, '\n');
+}
+
+/** ¿Es un token de control que no queremos mostrar? */
+function isControlToken(s: string): boolean {
+  const t = s.trim().toUpperCase();
+  return t === 'INPROGRESS' || t === 'FINISHED' || t === '[DONE]';
+}
+
+/** Emite un texto largo en pequeños deltas (mejor UX visual) */
+function emitChunked(res: any, messageId: string, text: string) {
+  const clean = normalizeText(text);
+
+  // Primero intenta cortar por frases
+  const sentences = clean.split(/(?<=[\.!\?])\s+(?=[A-Z¡¿“"'\(]|$)/);
+  if (sentences.length > 1) {
+    for (const s of sentences) {
+      const part = s.trim();
+      if (!part) continue;
+      sseEvent(res, 'message.delta', { id: messageId, delta: { content: part + ' ' } });
+    }
+    return;
+  }
+
+  // Si no hay frases claras, corta por tamaño aprox. 120 chars
+  const CHUNK = 120;
+  for (let i = 0; i < clean.length; i += CHUNK) {
+    const slice = clean.slice(i, i + CHUNK);
+    if (slice.trim()) {
+      sseEvent(res, 'message.delta', { id: messageId, delta: { content: slice } });
+    }
+  }
+}
+
 /** Extraer texto final de respuestas JSON (array/objeto) de Flowise */
 function extractFinalText(payload: any): string {
   try {
@@ -83,7 +122,7 @@ app.get('/agui/stream', async (req, res) => {
   try {
     const url  = `${FLOWISE_BASE_URL}/api/v1/prediction/${encodeURIComponent(chatflowId)}`;
 
-    // 👉 Mandamos ambas banderas
+    // Enviamos ambas banderas para maximizar compatibilidad
     const body: Record<string, any> = { question, stream: true, streaming: true };
 
     // Timeout
@@ -128,25 +167,24 @@ app.get('/agui/stream', async (req, res) => {
         res.end();
         return 'DONE';
       }
+      if (isControlToken(s)) return; // ignora INPROGRESS / FINISHED
+
+      // Intenta JSON → extrae texto; si no, emite tal cual
       try {
         const chunk = JSON.parse(s);
-        if (chunk && typeof chunk === 'object') {
-          const token: any =
-            chunk.text ??
-            chunk.delta?.content ??
-            chunk.data?.content ??
-            chunk.data;
-          if (typeof token === 'string' && token) {
-            sseEvent(res, 'message.delta', { id: messageId, delta: { content: token } });
-            return;
-          }
-        }
-        if (typeof chunk === 'string' && chunk) {
-          sseEvent(res, 'message.delta', { id: messageId, delta: { content: chunk } });
+        let token: any =
+          chunk?.text ??
+          chunk?.delta?.content ??
+          chunk?.data?.content ??
+          chunk?.data;
+        if (typeof token === 'string') {
+          if (!isControlToken(token)) emitChunked(res, messageId, token);
           return;
         }
+        // Si la estructura no trae texto claro, emite el raw "bonito"
+        sseEvent(res, 'message.delta', { id: messageId, delta: { content: normalizeText(s) } });
       } catch {
-        sseEvent(res, 'message.delta', { id: messageId, delta: { content: s } });
+        if (!isControlToken(s)) emitChunked(res, messageId, s);
       }
     };
 
@@ -154,7 +192,7 @@ app.get('/agui/stream', async (req, res) => {
       let l = (line ?? '').trim();
       if (!l) return;
       if (l.startsWith('message:')) {
-        l = l.slice('message:'.length).trim();
+        l = l.slice('message:'.length).trim(); // deja "data: {...}" si viene así
       }
       if (l.startsWith('event:')) {
         currentEvent = l.slice('event:'.length).trim() || null;
@@ -205,9 +243,7 @@ app.get('/agui/stream', async (req, res) => {
     try {
       const json = JSON.parse(buffer || (await resp.text()));
       const final = extractFinalText(json);
-      if (final) {
-        sseEvent(res, 'message.delta', { id: messageId, delta: { content: final } });
-      }
+      if (final) emitChunked(res, messageId, final);
       sseEvent(res, 'message.completed', { id: messageId, role: 'assistant' });
       sseEvent(res, 'run.completed', { id: runId });
       res.end();
