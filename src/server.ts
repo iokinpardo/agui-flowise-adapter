@@ -83,10 +83,10 @@ app.get('/agui/stream', async (req, res) => {
   try {
     const url  = `${FLOWISE_BASE_URL}/api/v1/prediction/${encodeURIComponent(chatflowId)}`;
 
-    // 👉 Enviamos ambas banderas para maximizar compatibilidad
+    // 👉 Mandamos ambas banderas
     const body: Record<string, any> = { question, stream: true, streaming: true };
 
-    // Timeout 30s para no quedarnos colgados
+    // Timeout
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 30_000);
 
@@ -113,37 +113,62 @@ app.get('/agui/stream', async (req, res) => {
       return;
     }
 
-    // --- Estrategia: intentar SIEMPRE parsear como stream de líneas ---
-    // Si vemos 'data:' → tratamos como SSE; si no hay 'data:' → al final intentamos JSON.
-    const hasGetReader = typeof (resp.body as any).getReader === 'function';
+    // --- Parser SSE robusto ---
+    let currentEvent: string | null = null;
+    let sawAnyData = false;
     const decoder = new TextDecoder();
     let buffer = '';
-    let sawDataLine = false;
 
-    const processLine = (line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-      if (trimmed.startsWith('data:')) {
-        sawDataLine = true;
-        const raw = trimmed.slice(5).trim();
-        if (raw === '[DONE]') {
-          sseEvent(res, 'message.completed', { id: messageId, role: 'assistant' });
-          sseEvent(res, 'run.completed', { id: runId });
-          res.end();
-          return 'DONE';
+    const handleDataPayload = (raw: string) => {
+      const s = raw.trim();
+      if (!s) return;
+      if (s === '[DONE]') {
+        sseEvent(res, 'message.completed', { id: messageId, role: 'assistant' });
+        sseEvent(res, 'run.completed', { id: runId });
+        res.end();
+        return 'DONE';
+      }
+      try {
+        const chunk = JSON.parse(s);
+        if (chunk && typeof chunk === 'object') {
+          const token: any =
+            chunk.text ??
+            chunk.delta?.content ??
+            chunk.data?.content ??
+            chunk.data;
+          if (typeof token === 'string' && token) {
+            sseEvent(res, 'message.delta', { id: messageId, delta: { content: token } });
+            return;
+          }
         }
-        try {
-          const chunk = JSON.parse(raw);
-          const token = typeof chunk === 'string' ? chunk : (chunk.text ?? '');
-          if (token) sseEvent(res, 'message.delta', { id: messageId, delta: { content: token } });
-        } catch {
-          sseEvent(res, 'message.delta', { id: messageId, delta: { content: raw } });
+        if (typeof chunk === 'string' && chunk) {
+          sseEvent(res, 'message.delta', { id: messageId, delta: { content: chunk } });
+          return;
         }
+      } catch {
+        sseEvent(res, 'message.delta', { id: messageId, delta: { content: s } });
       }
     };
 
+    const processLine = (line: string) => {
+      let l = (line ?? '').trim();
+      if (!l) return;
+      if (l.startsWith('message:')) {
+        l = l.slice('message:'.length).trim();
+      }
+      if (l.startsWith('event:')) {
+        currentEvent = l.slice('event:'.length).trim() || null;
+        return;
+      }
+      if (l.startsWith('data:')) {
+        sawAnyData = true;
+        const raw = l.slice('data:'.length).trim();
+        return handleDataPayload(raw);
+      }
+    };
+
+    const hasGetReader = typeof (resp.body as any).getReader === 'function';
     if (hasGetReader) {
-      // Web Streams (Undici)
       const reader = (resp.body as any).getReader();
       while (true) {
         const { value, done } = await reader.read();
@@ -157,7 +182,6 @@ app.get('/agui/stream', async (req, res) => {
         }
       }
     } else {
-      // Node Readable clásico
       for await (const chunk of resp.body as any) {
         buffer += chunk.toString();
         let idx: number;
@@ -169,23 +193,20 @@ app.get('/agui/stream', async (req, res) => {
       }
     }
 
-    // Si **sí** vimos líneas 'data:' pero no vino '[DONE]', cerramos amablemente
-    if (sawDataLine) {
+    if (sawAnyData) {
       sseEvent(res, 'message.completed', { id: messageId, role: 'assistant' });
       sseEvent(res, 'run.completed', { id: runId });
       res.end();
       return;
     }
 
-    // No hubo 'data:' → probablemente JSON normal
+    // Fallback JSON
     sseEvent(res, 'status.update', { at: Date.now(), msg: 'Non-SSE response, parsing JSON…' });
     try {
       const json = JSON.parse(buffer || (await resp.text()));
       const final = extractFinalText(json);
       if (final) {
         sseEvent(res, 'message.delta', { id: messageId, delta: { content: final } });
-      } else {
-        sseEvent(res, 'status.update', { at: Date.now(), msg: 'No se encontró texto final en JSON de Flowise' });
       }
       sseEvent(res, 'message.completed', { id: messageId, role: 'assistant' });
       sseEvent(res, 'run.completed', { id: runId });
