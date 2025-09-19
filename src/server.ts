@@ -18,13 +18,16 @@ function sseEvent(res: any, event: string, data: any) {
 function normalizeText(s: string): string {
   return s.replace(/<br\s*\/?>/gi, '\n').replace(/&nbsp;/gi, ' ').replace(/\r\n/g, '\n');
 }
+function isPlaceholderValue(value: any): boolean {
+  return typeof value === 'string' && value.trim() === '{{ output }}';
+}
 function isControlToken(s: string): boolean {
   const t = s.trim().toUpperCase();
   return t === 'INPROGRESS' || t === 'FINISHED' || t === '[DONE]';
 }
 function emitChunked(res: any, messageId: string, text: string) {
   const clean = normalizeText(text);
-  const sentences = clean.split(/(?<=[\.!\?])\s+(?=[A-ZÁÉÍÓÚÜÑ¡¿“"'\(]|$)/);
+  const sentences = clean.split(/(?<=[\.\!\?])\s+(?=[A-ZAÁÉÍÓÚÑ"'(|]|$)/);
   if (sentences.length > 1) {
     for (const s of sentences) {
       if (s.trim()) sseEvent(res, 'message.delta', { id: messageId, delta: { content: s.trim() + ' ' } });
@@ -60,6 +63,7 @@ function emitStateDiff(res: any, lastState: Record<string, any>, nextState: Reco
   const changed: Record<string, any> = {};
   let changedFlag = false;
   for (const [k, v] of Object.entries(nextState)) {
+    if (isPlaceholderValue(v)) continue;
     if (lastState[k] !== v) {
       changed[k] = v;
       lastState[k] = v;
@@ -135,7 +139,7 @@ app.get('/agui/stream', async (req, res) => {
     let buffer = '';
     const lastState: Record<string, any> = {};
     const emittedContentKeys = new Set<string>();
-    const hash = (s: string) => { let h=0; for (let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))|0; return h.toString(36); };
+    const hash = (s: string) => { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h.toString(36); };
 
     const handleExecutedNode = (node: any) => {
       const nodeId = node?.nodeId || node?.data?.id || '';
